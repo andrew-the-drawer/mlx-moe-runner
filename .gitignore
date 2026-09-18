@@ -1,0 +1,10 @@
+build/
+build-*/
+*.mlxmoe/
+*.gguf
+*.bin
+*.safetensors
+profile.json
+.DS_Store
+.cache/
+compile_commands.json
