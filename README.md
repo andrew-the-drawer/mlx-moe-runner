@@ -91,7 +91,20 @@ carries gpt-oss analysis / Qwen `<think>` output), `POST /v1/completions`, `GET 
 `GET /v1/stats`, `GET /health`. Requests are served one at a time; the KV cache is reused
 across requests that share a prompt prefix (multi-turn chats only prefill the new turn).
 
-### 4. Pinning profiles (optional)
+### 4. Pick a configuration
+
+```sh
+mlx-moe-runner plan ~/models/gptoss120b.mlxmoe          # probes RAM and SSD, prints the best flags
+mlx-moe-runner plan ~/models/gptoss120b.mlxmoe --ram 16 # what-if for another machine
+```
+
+`plan` predicts tok/s for pin budgets, cold buffer sizes, routing bias and lookahead
+depth from a cost model fitted to the measurements below (per-layer sync overhead, GPU
+bandwidth, measured SSD read latency and bandwidth, pinned hit-rate curves) and prints
+the recommended `serve` line plus the best exact-routing alternative. Treat it as a
+starting point and confirm with `bench`.
+
+### 5. Pinning profiles (optional)
 
 ```sh
 mlx-moe-runner profile ~/models/gptoss120b.mlxmoe --text corpus.txt --out profile.json

@@ -12,6 +12,7 @@
 
 #include "convert/convert.h"
 #include "engine/engine.h"
+#include "engine/plan.h"
 #include "server/server.h"
 #include "tokenizer/chat.h"
 #include "util/log.h"
@@ -47,7 +48,7 @@ Args parse_args(int argc, char** argv, int start) {
       } else if (i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0 &&
                  key != "stats" && key != "verbose" && key != "quiet" && key != "chat" && key != "raw" &&
                  key != "no-wire" && key != "no-verify" && key != "exact" && key != "no-thinking" &&
-                 key != "skip-experts" && key != "cached" && key != "help" && key != "warmup") {
+                 key != "skip-experts" && key != "cached" && key != "help" && key != "warmup" && key != "no-probe") {
         val = argv[++i];
       }
       a.flags[key] = val;
@@ -73,7 +74,8 @@ void usage() {
           "  mlx-moe-runner serve <model-dir> [--host 127.0.0.1] [--port 8080] [engine options]\n"
           "  mlx-moe-runner profile <model-dir> --text FILE --out profile.json [engine options]\n"
           "  mlx-moe-runner bench <model-dir> [-n TOKENS] [--prompts FILE] [engine options]\n"
-          "  mlx-moe-runner info <model-dir>\n\n"
+          "  mlx-moe-runner info <model-dir>\n"
+          "  mlx-moe-runner plan <model-dir> [--ram GB] [--ctx N] [--exact] [--no-probe]   recommend pin/cold/bias/lookahead\n\n"
           "Engine options:\n"
           "  --pin N           experts pinned in RAM per layer (default: auto from RAM, see --ram-fraction)\n"
           "  --ram-fraction F  share of physical RAM the model may use when --pin is auto (default 0.5)\n"
@@ -196,6 +198,18 @@ int cmd_convert(const Args& a) {
   o.skip_experts = a.has("skip-experts");
   o.verify = !a.has("no-verify");
   return run_convert(o);
+}
+
+int cmd_plan(const Args& a) {
+  if (a.positional.empty()) { usage(); return 2; }
+  PlanOptions o;
+  o.model_dir = a.positional[0];
+  o.ram_gb = a.get_double("ram", 0);
+  o.ctx = a.get_int("ctx", 4096);
+  o.exact_only = a.has("exact");
+  o.probe = !a.has("no-probe");
+  o.top = a.get_int("top", 6);
+  return run_plan(o);
 }
 
 int cmd_info(const Args& a) {
@@ -419,6 +433,7 @@ int main(int argc, char** argv) {
     if (cmd == "profile") return cmd_profile(a);
     if (cmd == "bench") return cmd_bench(a);
     if (cmd == "info") return cmd_info(a);
+    if (cmd == "plan") return cmd_plan(a);
     if (cmd == "--version" || cmd == "version") {
       printf("mlx-moe-runner %s\n", MMR_VERSION);
       return 0;

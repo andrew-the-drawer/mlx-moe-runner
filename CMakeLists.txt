@@ -59,6 +59,7 @@ add_library(mmr_core STATIC
   src/engine/lookahead.cpp
   src/engine/sampler.cpp
   src/engine/engine.cpp
+  src/engine/plan.cpp
   src/tokenizer/bpe_tokenizer.cpp
   src/tokenizer/chat.cpp
   src/server/server.cpp
