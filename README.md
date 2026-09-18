@@ -3,10 +3,11 @@
 Run 100B-class Mixture-of-Experts language models on a RAM-constrained Mac by streaming
 experts from the SSD, with all compute on the GPU through [MLX](https://github.com/ml-explore/mlx).
 
-gpt-oss-120b (61 GB of experts) decodes at ~29 tok/s on a 36 GB M5 Max with 14 GB of
-experts pinned in unified memory and the rest read on demand from the internal NVMe. Nothing
-is swapped and nothing is dequantized: expert weights stay in their 4-bit blocks from the
-file to the Metal kernel.
+gpt-oss-120b (61 GB of experts) decodes at ~20 tok/s on a 36 GB M5 Max with 14 GB of
+experts pinned in unified memory and the rest read on demand from the internal NVMe
+(13.7 tok/s with exact routing; 29 tok/s when the page cache is warm). Nothing is swapped
+and nothing is dequantized: expert weights stay in their 4-bit blocks from the file to the
+Metal kernel.
 
 The engine implements the algorithms measured in the
 [TinyGiant study](../tinygiant/docs/study-100b-on-a-mac.md) (two-tier expert store with
@@ -111,6 +112,7 @@ computed at convert time. A profile built from real traffic gives a better pinne
 | `--lookahead J` | 0 | prefetch experts predicted J layers ahead from the residual stream |
 | `--extra X` | 0 | extra prefetch candidates per layer (costs bandwidth) |
 | `--io-threads` | 8 | parallel SSD readers |
+| `--io-split` | 1 | sub-reads per expert record (0 = one per matrix; measured neutral on the M5 Max SSD) |
 | `--ctx` | 4096 | KV cache length |
 | `--chunk` | 32 | prefill chunk (tokens per pass) |
 
@@ -124,11 +126,35 @@ compute slows 3-5x.
 gpt-oss-120b, M5 Max 36 GB, internal NVMe, greedy, 32 experts/layer pinned (14.2 GB),
 1.5 GB cold buffer, page cache evicted before each run, 3 prompts x 32 tokens:
 
-RESULTS_TABLE
+| config | tok/s | pinned hit | SSD reads/tok | demand wait ms/tok | TinyGiant (CPU) |
+|---|---:|---:|---:|---:|---:|
+| exact routing | 13.7 | 60% | 47 | 52 | 9.1 |
+| exact + lookahead 1 | 14.7 | 60% | 56 | 44 | 11.1 |
+| exact + lookahead 2 | 13.0 | 60% | 67 | 51 | 11.5 |
+| **bias 0.5** (default) | **19.5** | 73% | 18 | 21 | 16.9 |
+| bias 0.5 + lookahead 1 | 19.9 | 71% | 43 | 25 | 13.9 |
+| bias 0.5 + lookahead 2 | 17.4 | 71% | 50 | 29 | 13.8 |
 
-For reference the TinyGiant CPU engine (fused int8 NEON kernels) reached 9.1 tok/s exact
-and 16.9 tok/s with bias 0.5 on the same machine and model. gpt-oss-20b with everything
-pinned decodes at ~50 tok/s and matches llama.cpp's greedy output token for token.
+With a warm page cache (right after conversion, or on a machine whose SSD is not the
+bottleneck) the same bias configuration measured 29 tok/s; the evicted numbers above are
+the steady state. Prefill on the 120b is SSD-bound at roughly 230 MB of expert reads per
+prompt token (35-45 tok/s). The per-token compute floor with everything resident is
+~22 ms (36 GPU syncs, attention, output head), i.e. ~45 tok/s.
+
+An uncached 13 MB expert read costs ~1.2 ms on this SSD regardless of how it is split
+(`scripts/` has the probe), so with ~1 miss per layer the exact-routing wait is ~36 ms per
+token; prefetching (lookahead) trades bandwidth for that latency and the routing bias
+removes most of the misses outright, which is why bias alone wins at this pin budget.
+
+Other models on the same machine, everything pinned: gpt-oss-20b 50 tok/s (greedy output
+identical to llama.cpp for 32 tokens), Qwen3-30B-A3B 16 tok/s all pinned and 20 tok/s
+with 16 of 128 experts pinned plus bias and lookahead (the first 19 greedy tokens match
+llama.cpp; the rest diverge as its Q6_K tensors are requantized). Qwen's 48 layers of
+small experts are bound by per-layer launch and sync overhead rather than bandwidth; that
+overhead (~1 ms per layer) is the next thing to attack.
+
+The TinyGiant column is the CPU engine (fused int8 NEON kernels) from the study on the
+same machine and model.
 
 ## How it works
 
@@ -158,6 +184,9 @@ See [docs/design.md](docs/design.md). In short:
 * Speculative decoding and the token-id prior from the study are not implemented; the
   study found neither pays for itself.
 * Only GGUF inputs; MLX-community safetensors checkpoints are not read directly.
+* Per-layer GPU sync overhead (~0.5-1 ms per layer) caps all-resident decode below what a
+  fully lazy MLX graph reaches; it is inherent to streaming (the route must reach the CPU)
+  but the kernel count per layer can still be reduced.
 
 ## License
 
