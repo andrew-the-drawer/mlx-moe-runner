@@ -79,7 +79,7 @@ void usage() {
           "  --ram-fraction F  share of physical RAM the model may use when --pin is auto (default 0.5)\n"
           "  --cold-mb MB      cold-expert buffer size (default 1536)\n"
           "  --io-threads N    SSD reader threads (default 8)\n"
-          "  --io-split N      sub-reads per expert record: 0 = one per matrix (default), 1 = whole record\n"
+          "  --io-split N      sub-reads per expert record: 1 = whole record (default), 0 = one per matrix\n"
           "  --bias B          cache-aware routing bias toward resident experts (default 0.5; 0 = exact routing)\n"
           "  --margin M        only swap an expert when its logit gap is below M\n"
           "  --lookahead J     prefetch experts predicted J layers ahead (default 0)\n"
@@ -101,7 +101,7 @@ EngineOptions engine_options(const Args& a, const std::string& model_dir) {
   o.model_dir = model_dir;
   o.cold_budget_bytes = (uint64_t)(a.get_double("cold-mb", 1536.0) * 1048576.0);
   o.io_threads = a.get_int("io-threads", 8);
-  o.io_split = a.get_int("io-split", 0);
+  o.io_split = a.get_int("io-split", 1);
   o.kv_max = a.get_int("ctx", 4096);
   o.prefill_chunk = a.get_int("chunk", 32);
   o.routing.bias = a.has("exact") ? 0.f : (float)a.get_double("bias", 0.5);
@@ -216,9 +216,16 @@ int cmd_info(const Args& a) {
   printf("  expert record %s (%s on disk), all experts %s, converted layers %zu/%d\n",
          human_bytes((double)L.payload_bytes()).c_str(), human_bytes((double)L.record_bytes).c_str(),
          human_bytes((double)L.record_bytes * L.n_experts * spec.n_layers).c_str(), L.files.size(), spec.n_layers);
-  if (j.contains("base_quant"))
-    for (auto& [k, v] : j["base_quant"].items())
-      printf("  %s: %s %d-bit g%d\n", k.c_str(), v.value("mode", "none").c_str(), v.value("bits", 0), v.value("group", 0));
+  if (j.contains("base_quant")) {
+    std::map<std::string, std::string> summary; // role -> "mode bits" set
+    for (auto& [k, v] : j["base_quant"].items()) {
+      std::string role = k;
+      if (role.rfind("blk.", 0) == 0) role = role.substr(role.find('.', 4) + 1);
+      std::string desc = v.value("mode", "none") + " " + std::to_string(v.value("bits", 0)) + "-bit g" + std::to_string(v.value("group", 0));
+      if (summary[role].find(desc) == std::string::npos) summary[role] += (summary[role].empty() ? "" : ", ") + desc;
+    }
+    for (auto& [role, desc] : summary) printf("  %s: %s\n", role.c_str(), desc.c_str());
+  }
   uint64_t ram = physical_memory();
   printf("  this machine: %s RAM; at 50%% budget ~%d experts/layer can be pinned\n", human_bytes((double)ram).c_str(),
          (int)((ram * 0.5 - 3.0e9 - 1.5e9) / ((double)L.payload_bytes() * spec.n_layers)));

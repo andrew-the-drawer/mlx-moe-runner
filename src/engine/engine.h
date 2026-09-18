@@ -25,7 +25,7 @@ struct EngineOptions {
   std::string model_dir;
   uint64_t cold_budget_bytes = (uint64_t)1536 << 20;
   int io_threads = 8;
-  int io_split = 0;             // sub-reads per expert record (0 = one per matrix, 1 = whole record)
+  int io_split = 1;             // sub-reads per expert record (1 = whole record, 0 = one per matrix)
   bool nocache = true;
   int kv_max = 4096;
   int prefill_chunk = 32;

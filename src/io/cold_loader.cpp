@@ -129,8 +129,8 @@ void ColdLoader::begin_layer(int layer) {
   layer_ = layer;
 }
 
-void ColdLoader::push_locked(int prio, ExpertKey key) {
-  for (int g = 0; g < (int)groups_.size(); g++) queue_.push(Job{prio, ++seq_, key, g});
+void ColdLoader::push_locked(int prio, const std::shared_ptr<Entry>& e) {
+  for (int g = 0; g < (int)groups_.size(); g++) queue_.push(Job{prio, ++seq_, e->key, e->id, g});
   cv_work_.notify_all();
 }
 
@@ -169,18 +169,19 @@ void ColdLoader::request_many(const std::vector<ExpertKey>& keys, int prio) {
       } else if (!e->ready && !e->inflight && prio < e->prio) {
         e->prio = prio;
         e->generation = generation_;
-        push_locked(prio, key);
+        push_locked(prio, e);
       }
       continue;
     }
     auto e = std::make_shared<Entry>();
+    e->id = ++next_id_;
     e->key = key;
     e->size = read_len_;
     e->prio = prio;
     e->generation = generation_;
     e->prefetched = prio != PRIO_DEMAND;
     entries_[key] = e;
-    push_locked(prio, key);
+    push_locked(prio, e);
   }
 }
 
@@ -198,19 +199,20 @@ ExpertViews ColdLoader::get(ExpertKey key) {
       auto it = entries_.find(key);
       if (it == entries_.end()) {
         e = std::make_shared<Entry>();
+        e->id = ++next_id_;
         e->key = key;
         e->size = read_len_;
         e->prio = PRIO_DEMAND;
         e->generation = generation_;
         e->prefetched = false;
         entries_[key] = e;
-        push_locked(PRIO_DEMAND, key);
+        push_locked(PRIO_DEMAND, e);
       } else {
         e = it->second;
         if (!e->ready && !e->inflight && e->prio != PRIO_DEMAND) {
           e->prio = PRIO_DEMAND;
           e->generation = generation_;
-          push_locked(PRIO_DEMAND, key);
+          push_locked(PRIO_DEMAND, e);
         }
       }
       if (!e->ready) {
@@ -261,7 +263,7 @@ bool ColdLoader::next_job_locked(std::shared_ptr<Entry>& out, int* group) {
     Job job = queue_.top();
     queue_.pop();
     auto it = entries_.find(job.key);
-    if (it == entries_.end()) continue;
+    if (it == entries_.end() || it->second->id != job.id) continue; // entry dropped/replaced
     auto e = it->second;
     if (e->ready) continue;
     if (!e->inflight) {
@@ -319,6 +321,7 @@ void ColdLoader::worker() {
       e->failed = true;
     }
     if (--e->remaining > 0) continue;
+    if (e->ready) continue; // defensive: never publish twice
     if (e->failed) {
       release_bufs(*e);
       resident_bytes_ -= e->size;

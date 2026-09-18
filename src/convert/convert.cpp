@@ -89,11 +89,6 @@ QuantDesc choose_quant(TensorType t, const ConvertOptions& opts) {
   return q;
 }
 
-bool is_exact(TensorType t) {
-  quant::MlxQuant mq;
-  return quant::exact_mlx_quant(t, &mq);
-}
-
 // A converted matrix in MLX layout, as raw bytes.
 struct MatrixBytes {
   std::vector<uint8_t> w, scales, biases;
@@ -159,7 +154,10 @@ void convert_matrix(TensorType t, const uint8_t* src, int out_dim, int in_dim, c
     }
     throw std::runtime_error("dense conversion of quantized tensor not supported");
   }
-  if (is_exact(t)) {
+  quant::MlxQuant exact;
+  bool exact_match = quant::exact_mlx_quant(t, &exact) && q.mode == exact.mode && q.bits == exact.bits &&
+                     q.group == exact.group;
+  if (exact_match) {
     size_t w_row = quant::packed_row_bytes(q.bits, in_dim);
     size_t groups = in_dim / q.group;
     size_t s_row = q.mode == "mxfp4" ? groups : groups * 2;
@@ -336,12 +334,13 @@ ExpertTensorSet expert_tensors(const gguf::Reader& r, int layer) {
 
 uint64_t align_up(uint64_t x, uint64_t a) { return (x + a - 1) / a * a; }
 
-ExpertLayout build_layout(const gguf::Reader& r, const ModelSpec& spec, const ConvertOptions& opts) {
+ExpertLayout build_layout(const gguf::Reader& r, const ModelSpec& spec, const ConvertOptions& opts,
+                          const std::vector<int>& layers) {
   ExpertLayout L;
   L.n_layers = spec.n_layers;
   L.n_experts = spec.n_experts;
   L.align = 4096;
-  auto ts = expert_tensors(r, opts.layers.empty() ? 0 : opts.layers[0]);
+  auto ts = expert_tensors(r, layers[0]);
   const TensorInfo* mats[3] = {ts.gate, ts.up, ts.down};
   const char* names[3] = {"gate", "up", "down"};
   uint64_t off = 0;
@@ -350,6 +349,24 @@ ExpertLayout build_layout(const gguf::Reader& r, const ModelSpec& spec, const Co
     if (t.dims.size() != 3 || (int)t.ne(2) != spec.n_experts)
       throw std::runtime_error(std::string("unexpected expert tensor shape for ") + t.name);
     QuantDesc q = choose_quant(t.type, opts);
+    // The record layout is shared by all layers: if any layer stores this matrix in
+    // a different ggml type, fall back to the lossy (near-lossless 8-bit) layout for all.
+    bool uniform = true;
+    for (int l : layers) {
+      auto tl = expert_tensors(r, l);
+      const TensorInfo* ml = i == 0 ? tl.gate : (i == 1 ? tl.up : tl.down);
+      if (ml->type != t.type) uniform = false;
+      if ((int)ml->ne(0) != (int)t.ne(0) || (int)ml->ne(1) != (int)t.ne(1))
+        throw std::runtime_error("expert shapes differ between layers");
+    }
+    if (!uniform) {
+      q.mode = "affine";
+      q.bits = opts.lossy_bits;
+      q.group = opts.lossy_group;
+      q.has_biases = true;
+      q.dtype = "float16";
+      MMR_INFO("  experts.%s: mixed ggml types across layers; converting all layers to %d-bit affine", names[i], q.bits);
+    }
     L.quant[names[i]] = q;
     int in_dim = (int)t.ne(0), out_dim = (int)t.ne(1);
     auto sz = matrix_sizes(q, out_dim, in_dim);
@@ -436,7 +453,7 @@ int run_convert(const ConvertOptions& opts) {
   if (layers.empty())
     for (int l = 0; l < spec.n_layers; l++) layers.push_back(l);
 
-  ExpertLayout L = build_layout(r, spec, opts);
+  ExpertLayout L = build_layout(r, spec, opts, layers);
   for (auto& [k, q] : L.quant)
     MMR_INFO("  experts.%s: %s%s", k.c_str(), q.mode.c_str(),
              q.quantized() ? (" " + std::to_string(q.bits) + "-bit g" + std::to_string(q.group)).c_str() : (" " + q.dtype).c_str());
@@ -457,8 +474,7 @@ int run_convert(const ConvertOptions& opts) {
     std::string base_name = t.name.substr(0, t.name.size() - 7);
     if (is_matrix && role != "ffn_gate_inp") {
       QuantDesc q = choose_quant(t.type, opts);
-      if (!q.quantized() && q.dtype == "float32") q.dtype = "float32";
-      base_quant.emplace(role, q);
+      base_quant[base_name] = q; // keyed by tensor: types may differ between layers
       convert_base_matrix(t, q, base_name, base, threads);
     } else {
       // norms, biases, routers, sinks, expert biases: dense f32
@@ -467,7 +483,7 @@ int run_convert(const ConvertOptions& opts) {
   }
   if (!base.count("output.weight")) {
     MMR_INFO("  no output.weight: tying to token embedding");
-    base_quant["output"] = base_quant["token_embd"];
+    base_quant["output"] = base_quant.at("token_embd");
     for (auto suffix : {".weight", ".scales", ".biases"})
       if (base.count(std::string("token_embd") + suffix)) base.emplace(std::string("output") + suffix, base.at(std::string("token_embd") + suffix));
   }
@@ -500,7 +516,12 @@ int run_convert(const ConvertOptions& opts) {
       uint64_t file_bytes = L.record_bytes * spec.n_experts;
       if (ftruncate(fd, (off_t)file_bytes) != 0) throw std::runtime_error("ftruncate failed for " + file.string());
 
-      bool all_exact = is_exact(ts.gate->type) && is_exact(ts.up->type) && is_exact(ts.down->type);
+      auto exact_for = [&](const TensorInfo* t, const char* n) {
+        quant::MlxQuant e;
+        const auto& q = L.quant.at(n);
+        return quant::exact_mlx_quant(t->type, &e) && q.mode == e.mode && q.bits == e.bits && q.group == e.group;
+      };
+      bool all_exact = exact_for(ts.gate, "gate") && exact_for(ts.up, "up") && exact_for(ts.down, "down");
       int outer_threads = all_exact ? threads : 1;
       int inner_threads = all_exact ? 1 : threads;
       std::vector<std::vector<uint8_t>> staging(outer_threads);

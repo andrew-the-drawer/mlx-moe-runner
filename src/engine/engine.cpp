@@ -378,7 +378,9 @@ mx::array Engine::forward_rows(const std::vector<int>& tokens, int start_pos, bo
     auto logits = mx::matmul(N, mx::transpose(mx::astype(L.router_w, mx::float32)));
     if (L.router_b) logits = mx::add(logits, mx::astype(*L.router_b, mx::float32));
     int l0 = i + 1, l1 = std::min(Lc, i + 1 + opts_.lookahead_depth);
-    bool do_la = opts_.lookahead_depth > 0 && l0 < l1;
+    // Lookahead only pays off for single-token decode; a prefill chunk already
+    // issues a whole layer's misses at once and is bandwidth-bound.
+    bool do_la = opts_.lookahead_depth > 0 && l0 < l1 && k == 1;
     std::optional<mx::array> la;
     if (do_la) la = lookahead_->logits(l0, l1, X);
     double t1 = now_s();

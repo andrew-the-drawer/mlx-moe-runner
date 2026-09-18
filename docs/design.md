@@ -98,14 +98,17 @@ budget are wired with `mx::set_wired_limit` so the OS does not page them.
 ### Cold loader
 
 A priority queue of `(prio, seq, key, group)`; priority 0 is a demand read, `10 + j` a
-lookahead prefetch for a layer *j* ahead. A record is split into one sub-read per matrix
-(gate, up, down: `--io-split`), so three threads work on one expert and its latency is
-roughly a third of a single-stream 13 MB read; the SSD scales with queue depth (11 GB/s
-single stream, ~18 GB/s at depth 8 on the study machine). The first sub-read to be
-dispatched does admission control: evict LRU entries until the record fits the budget
-(entries used by the layer currently computing are protected) and allocate one MLX buffer
-per part. Each sub-read is one `preadv` into its matrix's buffers; the last one to finish
-publishes the arrays. Prefetches
+lookahead prefetch for a layer *j* ahead. The first job of a record to be dispatched does
+admission control: evict LRU entries until the record fits the budget (entries used by the
+layer currently computing are protected) and allocate one MLX buffer per part; the read is
+one `preadv` scattering the record into those buffers.
+
+A record can optionally be split into one sub-read per matrix (`--io-split 0`) so several
+threads work on one expert. Measured on the M5 Max internal SSD with the page cache
+evicted, this does not help: a 13 MB uncached read takes ~1.2 ms whether it is issued as
+1, 3 or 8 requests, and even 8 independent records in flight only reach 13 GB/s
+aggregate. Per-expert latency is therefore a floor (~1.2 ms per miss, serialized per
+layer), which is why prefetching and the routing bias are the levers that matter. Prefetches
 whose generation (forward pass) has passed are dropped when they reach the head of the
 queue; `retarget` drops queued prefetches for a layer that a closer prediction no longer
 wants. Demand reads that do not fit the budget run anyway (`n_overflow`), so prefill chunks

@@ -101,6 +101,7 @@ class ColdLoader {
     uint64_t bytes;  // padded bytes covered
   };
   struct Entry {
+    uint64_t id = 0;
     ExpertKey key;
     uint64_t size;
     int prio;
@@ -123,12 +124,13 @@ class ColdLoader {
     int prio;
     uint64_t seq;
     ExpertKey key;
+    uint64_t id; // entry the job belongs to; stale jobs of dropped entries are skipped
     int group;
     bool operator>(const Job& o) const { return std::tie(prio, seq) > std::tie(o.prio, o.seq); }
   };
 
   size_t index(ExpertKey k) const { return (size_t)k.first * layout_.n_experts + k.second; }
-  void push_locked(int prio, ExpertKey key);
+  void push_locked(int prio, const std::shared_ptr<Entry>& e);
   void drop_locked(std::shared_ptr<Entry>& e);
   bool evict_locked(uint64_t need);
   bool next_job_locked(std::shared_ptr<Entry>& out, int* group);
@@ -153,6 +155,7 @@ class ColdLoader {
   std::list<ExpertKey> lru_;       // front = oldest
   std::priority_queue<Job, std::vector<Job>, std::greater<Job>> queue_;
   uint64_t seq_ = 0;
+  uint64_t next_id_ = 0;
   uint64_t generation_ = 0;
   int token_ = 0;
   int layer_ = -1;

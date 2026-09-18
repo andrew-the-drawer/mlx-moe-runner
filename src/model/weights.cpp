@@ -69,9 +69,14 @@ BaseWeights BaseWeights::load(const std::string& dir, const ModelSpec& spec, con
   std::map<std::string, QuantDesc> bq;
   if (config.contains("base_quant"))
     for (auto& [k, v] : config["base_quant"].items()) bq[k] = QuantDesc::from_json(v);
-  auto quant_of = [&](const std::string& role) {
-    auto it = bq.find(role);
-    if (it == bq.end()) throw std::runtime_error("config.json: no base_quant entry for " + role);
+  // base_quant is keyed by tensor name ("blk.3.attn_v"); older files used roles ("attn_v").
+  auto quant_of = [&](const std::string& name) {
+    auto it = bq.find(name);
+    if (it != bq.end()) return it->second;
+    std::string role = name;
+    if (role.rfind("blk.", 0) == 0) role = role.substr(role.find('.', 4) + 1);
+    it = bq.find(role);
+    if (it == bq.end()) throw std::runtime_error("config.json: no base_quant entry for " + name);
     return it->second;
   };
   auto get = [&](const std::string& name) -> mx::array {
@@ -94,10 +99,10 @@ BaseWeights BaseWeights::load(const std::string& dir, const ModelSpec& spec, con
     std::string p = "blk." + std::to_string(i) + ".";
     LayerWeights L;
     L.attn_norm = get(p + "attn_norm.weight");
-    L.q = make_qlinear(arrays, p + "attn_q", quant_of("attn_q"), spec.attn_bias);
-    L.k = make_qlinear(arrays, p + "attn_k", quant_of("attn_k"), spec.attn_bias);
-    L.v = make_qlinear(arrays, p + "attn_v", quant_of("attn_v"), spec.attn_bias);
-    L.o = make_qlinear(arrays, p + "attn_output", quant_of("attn_output"), spec.attn_bias);
+    L.q = make_qlinear(arrays, p + "attn_q", quant_of(p + "attn_q"), spec.attn_bias);
+    L.k = make_qlinear(arrays, p + "attn_k", quant_of(p + "attn_k"), spec.attn_bias);
+    L.v = make_qlinear(arrays, p + "attn_v", quant_of(p + "attn_v"), spec.attn_bias);
+    L.o = make_qlinear(arrays, p + "attn_output", quant_of(p + "attn_output"), spec.attn_bias);
     if (spec.qk_norm) {
       L.q_norm = get(p + "attn_q_norm.weight");
       L.k_norm = get(p + "attn_k_norm.weight");
