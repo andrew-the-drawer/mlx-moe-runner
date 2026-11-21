@@ -8,6 +8,8 @@
 #include <mlx/mlx.h>
 #include <nlohmann/json.hpp>
 
+#include "engine/kv_buffer.h"
+#include "engine/kv_store.h"
 #include "engine/lookahead.h"
 #include "engine/router.h"
 #include "engine/sampler.h"
@@ -28,6 +30,9 @@ struct EngineOptions {
   int io_split = 1;             // sub-reads per expert record (1 = whole record, 0 = one per matrix)
   bool nocache = true;
   int kv_max = 4096;
+  uint64_t kv_ram_bytes = 0;    // session store: idle sessions kept in RAM
+  uint64_t kv_disk_bytes = 0;   // session store: idle sessions on SSD (0 = off)
+  std::string kv_dir;           // SSD tier directory (default <model_dir>/kv-cache)
   int prefill_chunk = 32;
   RoutingConfig routing;
   int lookahead_depth = 0;
@@ -49,6 +54,7 @@ struct GenerateResult {
   int n_generated = 0;
   double prefill_s = 0;
   double decode_s = 0;
+  std::string cache_source = "none"; // where the reused prefix came from: none, live, ckpt, ram, disk
   std::string finish_reason = "length";
 };
 
@@ -81,11 +87,14 @@ class Engine {
   void warmup();
   void reset_kv();
   int kv_len() const { return kv_len_; }
+  // Unified memory held by the active KV cache (buffers + prompt checkpoint).
+  uint64_t kv_bytes() const { return kv_bytes_; }
   // Runs k tokens at positions start_pos.. through the model. Returns evaluated
   // float32 logits [k or 1, vocab] (last row only when last_only).
   mx::array forward_rows(const std::vector<int>& tokens, int start_pos, bool last_only = false);
-  // Prefill with prefix reuse; returns logits for the last prompt token.
-  mx::array prefill(const std::vector<int>& tokens, int* n_cached = nullptr);
+  // Prefill with prefix reuse (active cache, prompt checkpoint, session store); returns
+  // logits for the last prompt token.
+  mx::array prefill(const std::vector<int>& tokens, int* n_cached = nullptr, std::string* source = nullptr);
 
   // --- generation ---------------------------------------------------------------
   // on_token returns false to stop early.
@@ -97,14 +106,16 @@ class Engine {
   nlohmann::json stats_json() const;
 
  private:
-  struct KV {
-    mx::array k;
-    mx::array v;
-  };
   void attention(int layer, mx::array& X, int start_pos, int k);
   void moe(int layer, const mx::array& N, mx::array& X, int k, const std::vector<int>& experts,
            const std::vector<std::vector<std::pair<int, float>>>& rows_of);
   void apply_wired_limit();
+  bool kv_holds(int m) const;   // the active cache can continue from position m
+  bool ckpt_holds(int m) const; // the prompt checkpoint can continue from position m
+  KVPtrs live_ptrs();
+  void save_ckpt();
+  void restore_ckpt();
+  void save_live(uint64_t keep);
 
   EngineOptions opts_;
   nlohmann::json config_;
@@ -116,9 +127,19 @@ class Engine {
   std::unique_ptr<Router> router_;
   std::unique_ptr<Lookahead> lookahead_;
   std::vector<std::vector<int>> static_ranking_;
-  std::vector<KV> kv_;
+  std::vector<KVBuffer> kv_;
   std::vector<int> kv_tokens_;
   int kv_len_ = 0;
+  int ring_slack_ = kRingSlackMin;
+  bool has_ring_ = false;       // some sliding-window layer wraps (slots < ctx)
+  uint64_t kv_bytes_ = 0;
+  // Prompt checkpoint: kv_tokens_[0, ckpt_pos_) were the last prompt prefilled. For ring
+  // layers a copy of the ring at that point, so a follow-up turn that diverges from the
+  // generated tokens (harmony drops past analysis) can roll back further than the slack.
+  int ckpt_pos_ = -1;
+  int ckpt_lo_ = 0;             // lowest valid ring position in the checkpoint
+  std::vector<std::vector<float>> ckpt_k_, ckpt_v_;
+  std::unique_ptr<KVStore> store_;
   mx::array rope_freqs_;
   float rope_mscale_ = 1.f;
   EngineStats timers_;

@@ -1,5 +1,7 @@
 #include "engine/plan.h"
 
+#include "engine/kv_buffer.h"
+
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -103,7 +105,7 @@ int run_plan(const PlanOptions& opts) {
   struct stat st;
   double base_gb = stat((opts.model_dir + "/base.safetensors").c_str(), &st) == 0 ? st.st_size / 1e9 : 2.5;
   double ram_gb = opts.ram_gb > 0 ? opts.ram_gb : physical_memory() / 1e9;
-  double kv_gb = 2.0 * S.n_layers * S.n_kv_heads * opts.ctx * S.head_dim * 4 / 1e9;
+  double kv_gb = kv_cache_bytes(S, opts.ctx, kRingSlackMin) / 1e9;
   double rec_gb = L.record_bytes / 1e9;
   int E = S.n_experts, K = S.n_experts_used, Ln = S.n_layers;
 

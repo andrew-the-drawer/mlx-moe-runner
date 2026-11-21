@@ -89,6 +89,9 @@ void usage() {
           "  --profile FILE    pin from a usage profile (see `profile`) instead of prompt calibration\n"
           "  --calibrate N     calibration tokens before pinning in `run` (default 8; 0 = static ranking)\n"
           "  --ctx N           KV cache length (default 4096)\n"
+          "  --kv-ram-mb MB    session store: idle conversations' KV kept in RAM (default 0)\n"
+          "  --kv-disk-gb GB   session store: idle conversations' KV on SSD (default 0 = off)\n"
+          "  --kv-dir DIR      session store directory (default <model-dir>/kv-cache)\n"
           "  --chunk N         prefill chunk size (default 32)\n"
           "  --no-wire         do not wire weights with MLX's wired limit\n"
           "  --warmup          run a warmup pass before timing (run; serve/bench always do)\n"
@@ -105,6 +108,9 @@ EngineOptions engine_options(const Args& a, const std::string& model_dir) {
   o.io_threads = a.get_int("io-threads", 8);
   o.io_split = a.get_int("io-split", 1);
   o.kv_max = a.get_int("ctx", 4096);
+  o.kv_ram_bytes = (uint64_t)(a.get_double("kv-ram-mb", 0.0) * 1048576.0);
+  o.kv_disk_bytes = (uint64_t)(a.get_double("kv-disk-gb", 0.0) * 1e9);
+  o.kv_dir = a.get("kv-dir", "");
   o.prefill_chunk = a.get_int("chunk", 32);
   o.routing.bias = a.has("exact") ? 0.f : (float)a.get_double("bias", 0.5);
   if (a.has("margin")) o.routing.margin = (float)a.get_double("margin", 0);

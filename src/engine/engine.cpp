@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <set>
 #include <stdexcept>
@@ -17,6 +18,17 @@ namespace {
 double now_s() {
   return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+
+std::string fnv1a_hex(const std::string& s) {
+  uint64_t h = 1469598103934665603ull;
+  for (unsigned char c : s) h = (h ^ c) * 1099511628211ull;
+  char buf[17];
+  snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)h);
+  return buf;
+}
+
+// Shorter sessions are cheap to prefill again; not worth a snapshot.
+constexpr int kMinSaveTokens = 16;
 } // namespace
 
 Engine::Engine(const EngineOptions& opts) : opts_(opts), rope_freqs_(mx::array(0.f)) {
@@ -53,19 +65,52 @@ Engine::Engine(const EngineOptions& opts) : opts_(opts), rope_freqs_(mx::array(0
   mx::eval(rope_freqs_);
   rope_mscale_ = spec_.rope_mscale();
 
+  // Sliding-window layers get a ring of window + slack slots; the slack covers a prefill
+  // chunk and short rollbacks.
+  ring_slack_ = std::max(kRingSlackMin, opts.prefill_chunk);
+  KVGeometry geom;
+  geom.n_kv_heads = spec_.n_kv_heads;
+  geom.head_dim = spec_.head_dim;
   kv_.reserve(spec_.n_layers);
+  ckpt_k_.resize(spec_.n_layers);
+  ckpt_v_.resize(spec_.n_layers);
   for (int i = 0; i < spec_.n_layers; i++) {
-    KV kv{mx::zeros({1, spec_.n_kv_heads, opts.kv_max, spec_.head_dim}, mx::float32),
-          mx::zeros({1, spec_.n_kv_heads, opts.kv_max, spec_.head_dim}, mx::float32)};
-    mx::eval(kv.k, kv.v);
-    kv_.push_back(std::move(kv));
+    int slots = kv_slots(spec_, i, opts.kv_max, ring_slack_);
+    int window = slots < opts.kv_max ? spec_.sliding_window : 0; // a ring only if it can wrap
+    kv_.emplace_back(spec_.n_kv_heads, spec_.head_dim, slots, window);
+    kv_bytes_ += kv_.back().bytes();
+    geom.slots.push_back(slots);
+    geom.window.push_back(window);
+    if (window > 0) has_ring_ = true;
   }
-  if (opts.verbose)
-    MMR_INFO("Base weights %s, KV cache %s (%d positions), expert %s, cold buffer %s, %d I/O threads; ready in %.1fs",
-             human_bytes((double)base_.nbytes).c_str(),
-             human_bytes(2.0 * spec_.n_layers * spec_.n_kv_heads * opts.kv_max * spec_.head_dim * 4).c_str(),
-             opts.kv_max, human_bytes((double)layout_.payload_bytes()).c_str(),
-             human_bytes((double)opts.cold_budget_bytes).c_str(), opts.io_threads, now_s() - t0);
+  if (has_ring_)
+    for (int i = 0; i < spec_.n_layers; i++)
+      if (kv_[i].ring()) {
+        size_t n = (size_t)spec_.n_kv_heads * kv_[i].slots() * spec_.head_dim;
+        ckpt_k_[i].assign(n, 0.f);
+        ckpt_v_[i].assign(n, 0.f);
+        kv_bytes_ += 2 * n * sizeof(float);
+      }
+  if (opts.kv_ram_bytes > 0 || opts.kv_disk_bytes > 0) {
+    geom.model_id = fnv1a_hex(config_.dump());
+    KVStoreOptions so;
+    so.ram_bytes = opts.kv_ram_bytes;
+    so.disk_bytes = opts.kv_disk_bytes;
+    so.dir = opts.kv_dir.empty() ? opts.model_dir + "/kv-cache" : opts.kv_dir;
+    so.nocache = opts.nocache;
+    store_ = std::make_unique<KVStore>(geom, so);
+  }
+  if (opts.verbose) {
+    MMR_INFO("Base weights %s, KV cache %s (%d positions%s), expert %s, cold buffer %s, %d I/O threads; ready in %.1fs",
+             human_bytes((double)base_.nbytes).c_str(), human_bytes((double)kv_bytes_).c_str(), opts.kv_max,
+             has_ring_ ? (", window layers " + std::to_string(spec_.sliding_window + ring_slack_) + "-slot rings").c_str() : "",
+             human_bytes((double)layout_.payload_bytes()).c_str(), human_bytes((double)opts.cold_budget_bytes).c_str(),
+             opts.io_threads, now_s() - t0);
+    if (store_)
+      MMR_INFO("Session store: %s RAM, %s SSD%s%s", human_bytes((double)opts.kv_ram_bytes).c_str(),
+               human_bytes((double)opts.kv_disk_bytes).c_str(), opts.kv_disk_bytes ? " in " : "",
+               opts.kv_disk_bytes ? (opts.kv_dir.empty() ? opts.model_dir + "/kv-cache" : opts.kv_dir).c_str() : "");
+  }
 }
 
 Engine::~Engine() = default;
@@ -117,7 +162,7 @@ int Engine::pin_per_layer(const std::vector<int>& per_layer, const std::vector<s
 
 int Engine::suggest_pins(double ram_fraction) const {
   double ram = (double)physical_memory();
-  double kv = 2.0 * spec_.n_layers * spec_.n_kv_heads * opts_.kv_max * spec_.head_dim * 4;
+  double kv = (double)kv_bytes_ + (double)opts_.kv_ram_bytes;
   double budget = ram * ram_fraction - (double)base_.nbytes - (double)opts_.cold_budget_bytes - kv - (double)(1 << 30);
   if (budget <= 0) return 0;
   int per_layer = (int)(budget / ((double)layout_.payload_bytes() * spec_.n_layers));
@@ -126,7 +171,7 @@ int Engine::suggest_pins(double ram_fraction) const {
 
 void Engine::apply_wired_limit() {
   if (!opts_.wire) return;
-  uint64_t want = base_.nbytes + cache_->pinned_bytes() + opts_.cold_budget_bytes + ((uint64_t)512 << 20);
+  uint64_t want = base_.nbytes + cache_->pinned_bytes() + opts_.cold_budget_bytes + kv_bytes_ + ((uint64_t)512 << 20);
   uint64_t ram = physical_memory();
   if (ram > 0) want = std::min(want, (uint64_t)(ram * 0.7));
   // MLX rejects limits above the system wired limit; back off until one is accepted.
@@ -166,6 +211,64 @@ void Engine::warmup() {
 void Engine::reset_kv() {
   kv_len_ = 0;
   kv_tokens_.clear();
+  ckpt_pos_ = -1;
+  for (auto& b : kv_) b.set_state(0, 0);
+}
+
+bool Engine::kv_holds(int m) const {
+  for (auto& b : kv_)
+    if (!b.holds(m)) return false;
+  return true;
+}
+
+bool Engine::ckpt_holds(int m) const {
+  if (ckpt_pos_ < 0 || m > ckpt_pos_) return false;
+  for (auto& b : kv_)
+    if (b.ring() && !kv_ring_ok(b.window(), ckpt_lo_, m)) return false;
+  return true;
+}
+
+KVPtrs Engine::live_ptrs() {
+  KVPtrs p;
+  for (auto& b : kv_) {
+    p.k.push_back(b.k_data());
+    p.v.push_back(b.v_data());
+  }
+  return p;
+}
+
+void Engine::save_ckpt() {
+  ckpt_pos_ = kv_len_;
+  ckpt_lo_ = 0;
+  for (size_t l = 0; l < kv_.size(); l++)
+    if (kv_[l].ring()) {
+      ckpt_lo_ = std::max(ckpt_lo_, kv_[l].lo());
+      memcpy(ckpt_k_[l].data(), kv_[l].k_data(), ckpt_k_[l].size() * sizeof(float));
+      memcpy(ckpt_v_[l].data(), kv_[l].v_data(), ckpt_v_[l].size() * sizeof(float));
+    }
+}
+
+void Engine::restore_ckpt() {
+  for (size_t l = 0; l < kv_.size(); l++)
+    if (kv_[l].ring()) {
+      memcpy(kv_[l].k_data(), ckpt_k_[l].data(), ckpt_k_[l].size() * sizeof(float));
+      memcpy(kv_[l].v_data(), ckpt_v_[l].data(), ckpt_v_[l].size() * sizeof(float));
+      kv_[l].set_state(ckpt_pos_, ckpt_lo_);
+    }
+}
+
+void Engine::save_live(uint64_t keep) {
+  // Ring models are saved at the prompt checkpoint (what a returning conversation
+  // continues from); others with everything generated since.
+  int n = has_ring_ ? ckpt_pos_ : kv_len_;
+  if (n < kMinSaveTokens) return;
+  KVPtrs src = live_ptrs();
+  for (size_t l = 0; l < kv_.size(); l++)
+    if (has_ring_ && kv_[l].ring()) {
+      src.k[l] = ckpt_k_[l].data();
+      src.v[l] = ckpt_v_[l].data();
+    }
+  store_->put(std::vector<int>(kv_tokens_.begin(), kv_tokens_.begin() + n), src, has_ring_ ? ckpt_lo_ : 0, keep);
 }
 
 void Engine::attention(int layer, mx::array& X, int start_pos, int k) {
@@ -192,17 +295,11 @@ void Engine::attention(int layer, mx::array& X, int start_pos, int k) {
   }
   int end = start_pos + k;
   if (end > opts_.kv_max) throw std::runtime_error("context length exceeded (kv_max=" + std::to_string(opts_.kv_max) + ")");
-  auto& kv = kv_[layer];
-  auto new_k = mx::slice_update(kv.k, kk, {0, 0, start_pos, 0}, {1, Hkv, end, hd});
-  auto new_v = mx::slice_update(kv.v, v, {0, 0, start_pos, 0}, {1, Hkv, end, hd});
-  kv.k = new_k;
-  kv.v = new_v;
-
+  kv_[layer].write(kk, v, start_pos);
+  // Sliding-window rows attend to positions > q - window: read only those.
   int window = S.is_swa_layer(layer) ? S.sliding_window : 0;
-  int first = 0;
-  if (window > 0 && k == 1 && end > window) first = end - window;
-  auto K = mx::slice(kv.k, {0, 0, first, 0}, {1, Hkv, end, hd});
-  auto V = mx::slice(kv.v, {0, 0, first, 0}, {1, Hkv, end, hd});
+  int first = window > 0 ? std::max(0, start_pos - window + 1) : 0;
+  auto [K, V] = kv_[layer].read(first, end);
   std::optional<mx::array> sinks;
   if (L.sinks) sinks = mx::astype(*L.sinks, mx::float32);
   float scale = 1.0f / sqrtf((float)hd);
@@ -462,16 +559,56 @@ mx::array Engine::forward_rows(const std::vector<int>& tokens, int start_pos, bo
   return logits;
 }
 
-mx::array Engine::prefill(const std::vector<int>& tokens, int* n_cached) {
+mx::array Engine::prefill(const std::vector<int>& tokens, int* n_cached, std::string* source) {
   if (tokens.empty()) throw std::runtime_error("empty prompt");
-  // Reuse the KV prefix shared with the previous request.
-  size_t common = 0;
-  while (common < kv_tokens_.size() && common < tokens.size() && kv_tokens_[common] == tokens[common]) common++;
-  if (common >= tokens.size()) common = tokens.size() - 1; // always forward the last token for its logits
-  if ((int)common > kv_len_) common = kv_len_;
-  kv_len_ = (int)common;
-  kv_tokens_.assign(tokens.begin(), tokens.begin() + common);
-  if (n_cached) *n_cached = (int)common;
+  if ((int)tokens.size() > opts_.kv_max)
+    throw std::runtime_error("prompt of " + std::to_string(tokens.size()) + " tokens exceeds the context (kv_max=" +
+                             std::to_string(opts_.kv_max) + ")");
+  int max_reuse = (int)tokens.size() - 1; // always forward the last token for its logits
+  int common = 0;
+  while (common < (int)kv_tokens_.size() && common < max_reuse && kv_tokens_[common] == tokens[common]) common++;
+  common = std::min(common, kv_len_);
+
+  // 1. The active cache, as is or rolled back to the prompt checkpoint (rings only hold
+  //    the last window + slack positions, so a long rollback needs the checkpoint).
+  int live = kv_holds(common) ? common : 0;
+  bool use_ckpt = false;
+  if (has_ring_ && ckpt_pos_ > 0) {
+    int c = std::min(common, ckpt_pos_);
+    if (c > live && ckpt_holds(c)) {
+      live = c;
+      use_ckpt = true;
+    }
+  }
+  // 2. The session store.
+  KVStore::Match hit;
+  if (store_) hit = store_->find(tokens, std::min(max_reuse, opts_.kv_max));
+  bool from_store = hit.len > live;
+  // 3. A request that does not continue the previous prompt abandons that session: save it
+  //    first. (Continuing turns and regenerations keep everything up to the last prompt token.)
+  int kept = from_store ? 0 : live;
+  if (store_ && ckpt_pos_ > 0 && kept + 1 < ckpt_pos_) save_live(hit.id);
+
+  std::string src = "none";
+  if (from_store) {
+    if (store_->take(hit.id, hit.len, live_ptrs())) {
+      kv_len_ = hit.len;
+      src = tier_name(hit.tier);
+      for (auto& b : kv_) b.ring() ? b.set_state(hit.n, hit.lo) : b.set_state(hit.len, 0);
+    } else {
+      kv_len_ = 0;
+      for (auto& b : kv_) b.set_state(0, 0);
+    }
+    ckpt_pos_ = -1;
+  } else {
+    if (use_ckpt) restore_ckpt();
+    if (live > 0) src = use_ckpt ? "ckpt" : "live";
+    kv_len_ = live;
+    if (live < ckpt_pos_) ckpt_pos_ = -1; // positions past `live` are about to be rewritten
+  }
+  kv_tokens_.assign(tokens.begin(), tokens.begin() + kv_len_);
+  if (n_cached) *n_cached = kv_len_;
+  if (source) *source = src;
 
   int chunk = std::max(1, opts_.prefill_chunk);
   // Keep a chunk's worst-case cold footprint under the cold budget.
@@ -483,12 +620,13 @@ mx::array Engine::prefill(const std::vector<int>& tokens, int* n_cached) {
     chunk /= 2;
   }
   mx::array logits = mx::array(0.f);
-  for (size_t i = common; i < tokens.size(); i += chunk) {
+  for (size_t i = kv_len_; i < tokens.size(); i += chunk) {
     size_t n = std::min((size_t)chunk, tokens.size() - i);
     std::vector<int> part(tokens.begin() + i, tokens.begin() + i + n);
     logits = forward_rows(part, (int)i, true);
     kv_tokens_.insert(kv_tokens_.end(), part.begin(), part.end());
   }
+  save_ckpt();
   return logits;
 }
 
@@ -498,7 +636,7 @@ GenerateResult Engine::generate(const std::vector<int>& prompt, int max_tokens, 
   res.n_prompt = (int)prompt.size();
   Sampler sampler(sampling);
   double t0 = now_s();
-  auto logits = prefill(prompt, &res.n_cached);
+  auto logits = prefill(prompt, &res.n_cached, &res.cache_source);
   res.prefill_s = now_s() - t0;
   t0 = now_s();
   int pos = (int)prompt.size();
@@ -558,6 +696,8 @@ nlohmann::json Engine::stats_json() const {
                  {"restricted_fallback", s.router.restricted_fallback}};
   j["memory"] = {{"active", mx::get_active_memory()}, {"peak", mx::get_peak_memory()}, {"cache", mx::get_cache_memory()},
                  {"rss", resident_memory()}, {"wired_limit", wired_bytes_}};
+  j["kv"] = {{"len", kv_len_}, {"bytes", kv_bytes_}, {"ckpt_pos", ckpt_pos_},
+             {"store", store_ ? store_->stats_json() : nlohmann::json(nullptr)}};
   return j;
 }
 

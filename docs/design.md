@@ -14,7 +14,7 @@ study.
 | `src/model/` | `ModelSpec` (geometry + conventions from GGUF metadata), `ExpertLayout` (on-disk record format), `BaseWeights` (non-expert arrays, `QLinear`) |
 | `src/convert/` | GGUF → model directory converter |
 | `src/io/` | `ColdLoader` (priority queue, I/O threads, `F_NOCACHE` preadv, LRU budget) and `ExpertCache` (pinned banks + cold loader) |
-| `src/engine/` | `Engine` (forward pass, KV cache, generation), `Router` (top-k with bias), `Lookahead`, `Sampler` |
+| `src/engine/` | `Engine` (forward pass, generation, prefix reuse), `KVBuffer` (per-layer K/V, rings for sliding-window layers), `KVStore` (session store: RAM and SSD tiers), `Router` (top-k with bias), `Lookahead`, `Sampler` |
 | `src/tokenizer/` | byte-level BPE from HF `tokenizer.json` (PCRE2 pre-tokenizer), chat formats and output parsing |
 | `src/server/` | cpp-httplib OpenAI-compatible API |
 | `tests/` | unit tests for repackers, tokenizer, loader, router, layout |
@@ -64,9 +64,10 @@ chunks and single-token decode share the code):
 1. embeddings: rows of the quantized embedding table, dequantized on the GPU;
 2. per layer: RMS-norm, fused Q/K/V projections, optional QK-norm, RoPE (`fast::rope` with
    per-dimension periods, YaRN-scaled for gpt-oss, and the YaRN `mscale` applied to q and
-   k), KV write (`slice_update` into preallocated `[1, H_kv, ctx, d]` arrays), fused
-   `scaled_dot_product_attention` with attention sinks and a causal + sliding-window mask
-   for k > 1 (a K/V slice for k = 1), output projection;
+   k), KV write into the layer's `KVBuffer` (see [KV cache](#kv-cache)), fused
+   `scaled_dot_product_attention` (SDPA) with attention sinks over the positions the rows
+   can see (all of them for full attention, the last `window` for sliding-window layers),
+   with a causal + sliding-window mask for k > 1, output projection;
 3. router logits (and lookahead logits) are evaluated: **the one GPU sync per layer**;
 4. routing on the CPU: top-k, cache-aware bias, per-row gate weights from the unbiased
    logits; the union of experts over the k rows;
@@ -123,8 +124,10 @@ is set to 1 GB.
 Prompts are processed in chunks of `--chunk` tokens; each chunk's MoE loads each needed
 expert once for all rows. The chunk is capped so that a layer's worst-case cold footprint
 (`min(E, chunk * top_k)` experts, minus the pinned fraction) stays under 80% of the cold
-budget. The KV prefix shared with the previous request is reused, so a multi-turn chat
-prefills only its new tokens.
+budget. The prompt prefix already in the active KV cache, in the
+[prompt checkpoint](#prompt-checkpoint) or in the [session store](#session-store) is
+reused, so a multi-turn chat prefills only its new tokens. The last prompt token is always
+run again for its logits.
 
 ### Calibration and pinning
 
@@ -132,7 +135,203 @@ prefills only its new tokens.
 cache counts accesses; `pin` orders experts by count, backfills from the static ranking
 (router weights applied to random inputs at convert time), and loads the top *n* per layer.
 `profile` produces the same ranking from a text corpus for servers. The auto pin budget is
-`ram_fraction * RAM - base - cold budget - KV - 1 GB` divided over layers.
+`ram_fraction * RAM - base - cold budget - KV - session RAM tier - 1 GB` divided over
+layers.
+
+## KV cache
+
+### The idea: never prefill the same tokens twice, without spending memory on it
+
+Two costs pull in opposite directions:
+
+- **Prefilling is expensive.** On a streamed model every prompt token costs expert reads
+  from SSD: ~230 MB per token on gpt-oss-120b, 35-45 tok/s. An 8K-token conversation
+  takes ~200 s to prefill again.
+- **Memory is expensive too.** KV competes with pinned experts for unified memory (1 GB
+  is ~77 experts on the 120b), and fewer pinned experts slow down *every* token of *every*
+  request.
+
+KV that is already computed is worth keeping, but only the small part that is useful
+right now belongs in memory; the rest goes to SSD, where it costs nothing but disk space
+and reads back thousands of times faster than prefilling it again (72 KB per token on the
+120b, versus 230 MB of expert reads).
+
+So the engine keeps a few saved states, each in the cheapest place that still pays off,
+and for every request uses the cheapest one that can serve it:
+
+| source | what it holds | where | cost to reuse (8K tokens, 120b) | when it can serve |
+|---|---|---|---|---|
+| live cache | the active conversation | memory (always) | free | the prompt extends the cached tokens, or rolls back a short way (see [rollback](#rollback)) |
+| prompt checkpoint | sliding-window state at the end of the last prompt | memory, 28 MB | `memcpy` of 28 MB | a follow-up turn or a regenerate of the active conversation |
+| session store, RAM | conversations switched away from | memory, `--kv-ram-mb` | `memcpy` of ~0.63 GB | a conversation comes back (memory permitting) |
+| session store, SSD | the same, overflow and long term | SSD, `--kv-disk-gb` | ~0.1 s read | a conversation comes back, even after a restart |
+| none | | | full prefill, ~200 s | anything else |
+
+`prefill()` checks them in that order: the live cache, then the checkpoint, then the
+store (longest matching prefix wins); whichever reuses the most tokens is used, and only
+the rest is prefilled. Saving is just as frugal: the checkpoint is a fixed 28 MB copy
+taken after every prompt, and a conversation is written to the store only when a request
+abandons it. Continuing a chat or regenerating writes nothing.
+
+The rest of this section covers each piece: where memory goes, the per-layer buffers and
+why they limit rollback, the checkpoint, and the session store.
+
+### Memory tiers
+
+Apple silicon has one pool of unified memory shared by CPU and GPU, so there is no
+"offload to host RAM" tier: the only tier below memory is the SSD. What lives where:
+
+| tier | contents | bound |
+|---|---|---|
+| unified memory, wired | base weights, pinned expert banks, cold expert LRU, active KV cache | `mx::set_wired_limit(base + pinned + cold + KV + 512 MB)` |
+| unified memory | session store RAM tier (idle conversations) | `--kv-ram-mb` |
+| MLX buffer cache | freed buffers, reused by the next allocation of the same size | `set_cache_limit(1 GB)` |
+| SSD | expert records (`F_NOCACHE` reads), session store SSD tier | `--kv-disk-gb` |
+
+Every byte of KV in memory is a byte not available for pinned experts: on the 120b 1 GB
+is ~77 pinned experts, about 2 per layer, and every request pays for the extra misses.
+The design therefore keeps the active cache as small as exactness allows and moves idle
+conversations to the SSD rather than keeping them in memory.
+
+The active conversation's KV cannot be offloaded: SDPA reads every cached position of
+every layer for every token (2.4 GB per token at 32K context on the 120b, even with the
+rings below), from the same SSD the expert streaming already saturates. Only
+sparse/approximate attention could change that, which is out of scope for an exact engine.
+
+### KVBuffer
+
+Each layer has a `KVBuffer` holding K and V as float32 `[1, H_kv, slots, d]`, allocated
+once. Full-attention layers have `slots = ctx`. Sliding-window layers (gpt-oss: every other
+layer, window 128) keep a ring of `window + slack` slots, `slack = max(chunk, 256)`;
+position p lives in slot `p % slots`. A chunk that crosses the end of the ring is written
+with two `slice_update`s; reads of `[first, end)` return positions in order (two slices
+and a concatenate when they wrap), so SDPA sees the same keys in the same order as with a
+linear buffer. A ring is used only if it can wrap (`window + slack < ctx`).
+
+On gpt-oss-120b (36 layers, 8 KV heads x 64) this halves the cache: 0.36 GB instead of
+0.60 GB at 4K context, 2.5 GB instead of 4.8 GB at 32K, 9.7 GB instead of 19.3 GB at
+128K (the totals include the prompt-checkpoint copy of the rings, below). gpt-oss-20b:
+0.24 GB instead of 0.40 GB at 4K. Qwen3 has no sliding window and is unchanged.
+
+The slack also bounds the rows written in one pass (a prefill chunk), so the oldest row
+of a chunk still sees its whole window after the chunk overwrites the oldest slots.
+
+### Rollback
+
+A new request's tokens usually match the cached ones up to some position m and then
+differ. *Rolling back* means keeping positions `[0, m)` and recomputing from m. It happens
+on every request: a regenerate rolls back 1 token (the last prompt token is always run
+again for its logits), a chat follow-up rolls back the whole previous answer (harmony
+drops its analysis channel, Qwen3 its `<think>` block), an edited message rolls back to
+the edit.
+
+For a full-attention layer this is free: position p lives in row p and is never
+overwritten, so rolling back is setting the length to m.
+
+A ring forgets. With a toy window of 4 (a token sees itself and the 3 before it) and 6
+slots, after writing positions 0-9:
+
+```
+slot:   0  1  2  3  4  5
+holds:  6  7  8  9  4  5        positions 0-3 are gone; valid range [4, 10), lo = 4
+```
+
+- Roll back to m = 8: position 8 needs 5, 6, 7. All present, so it works.
+- Roll back to m = 6: position 6 needs 3, 4, 5. Position 3 is gone, so it can't.
+
+The rule is: continuing at m needs `[max(0, m - window + 1), m)`, so `m - window + 1 >= lo`,
+where `lo` is the ring's lowest valid position. A fresh ring has `lo = end - slots`, so it
+can roll back `slots - window + 1 = slack + 1` positions: 257 with the real numbers.
+
+`lo` must be tracked, not recomputed from `end`. Roll back from the state above to m = 7
+and write one token 7':
+
+```
+slot:   0  1   2  3  4  5
+holds:  6  7'  8  9  4  5       end = 8, but valid is still [4, 8): lo stays 4
+```
+
+`end - slots` would give `lo = 2` and allow rolling back to m = 5, which needs positions 2
+and 3. Those were overwritten before the first rollback. So each buffer keeps
+`lo = max(lo, end - slots)` across writes. A rollback lowers `end`, never `lo`; only a
+restart at position 0 resets it. A write that would need positions the ring no longer has
+throws instead of attending to stale keys.
+
+Regenerates and short edits fit within the slack. A chat follow-up rolls back hundreds or
+thousands of tokens, past the slack, which is what the checkpoint is for.
+
+### Prompt checkpoint
+
+A follow-up turn diverges from the cached tokens right after the previous prompt, so the
+rollback is the length of the previous answer, usually more than the slack. At the end of
+every prefill the engine therefore copies the rings (28 MB on the 120b) and records the
+position P and the rings' `lo`. Nothing is computed; it is a snapshot of the sliding-window
+state at the end of the prompt. Full-attention layers are not copied: generation only
+appends after P, so their rows `[0, P)` stay intact.
+
+Example on the 120b (window 128, 384 slots), prompt of 1,000 tokens, answer of 500:
+
+```
+after the prompt:  end = 1000, lo = 616   -> checkpoint taken (P = 1000, lo = 616)
+after the answer:  end = 1500, lo = 1116
+follow-up turn, matches up to m = 1000:
+  live rings:  1000 - 127 = 873 >= 1116?  no  (positions 873-999 were overwritten)
+  checkpoint:  873 >= 616?                yes -> copy the rings back, set end = 1000, lo = 616,
+                                                 keep the full layers, prefill from 1000
+```
+
+Regenerating the same prompt (m = P - 1) works the same way. The checkpoint can serve any
+m with `P - 257 <= m <= P` (less if `lo` was raised by an earlier rollback, which is why
+`lo` is recorded rather than assumed to be `P - 384`). It is dropped when a request rolls
+back below P (those positions are about to be rewritten; a new checkpoint is taken at the
+end of that prefill), when a session is restored from the store, and on `reset_kv`.
+
+### Session store
+
+`KVStore` keeps snapshots of conversations the engine switched away from, in a RAM tier
+(`--kv-ram-mb`, default 0) and an SSD tier (`--kv-disk-gb`, default 0 = off; directory
+`--kv-dir`, default `<model-dir>/kv-cache`). Both are LRU. A snapshot lives in exactly one
+tier: new snapshots go to RAM if they fit, RAM entries move to SSD when RAM is full (or
+are dropped without an SSD tier), and an entry leaves the store when it is restored into
+the active cache (it is saved again if the engine switches away again).
+
+A snapshot is the state after n tokens: for full-attention layers rows `[0, n)`, for rings
+the whole ring plus its `lo`. Ring models are saved at the prompt checkpoint (what a
+returning conversation continues from), others at the end of the generated tokens. The RAM
+blob and the file body share one layout: per layer K then V, each a section of `H_kv`
+chunks of `rows * d` floats, sections aligned to 16 KiB. A file adds a 16 KiB-aligned
+header (magic, JSON with the fingerprint, ring `lo` and the tokens). Snapshots are copied
+straight between the active buffers and the blob or file (`memcpy`, or `preadv`/`pwritev`
+with one iovec per head and `F_NOCACHE`), so a save or restore needs no extra memory the
+size of the conversation. Files are written to a temporary name and renamed.
+
+Cost on the 120b: 72 KB per token (half the layers are rings) plus 28 MB per snapshot,
+so an 8K-token conversation is ~0.63 GB, read back in ~0.1 s, versus ~200 s to prefill
+it again at 230 MB of expert reads per token.
+
+A snapshot is taken only when a request abandons the active conversation, i.e. keeps less
+than its last prompt minus one token (another conversation, or an edit before the end of
+the previous prompt), or when a store hit replaces the active cache. Continuing turns and
+regenerations write nothing. Sessions shorter than 16 tokens are not saved.
+
+Lookup: for each entry, the common prefix with the request (capped at the prompt length
+minus one and the context), accepted if the rings can continue from it
+(`m >= lo + window - 1`); the longest wins, RAM before SSD. The store is used when it
+beats what the active cache and the checkpoint offer; the active conversation is saved
+first, with the entry about to be restored protected from eviction. A new snapshot drops
+older entries it makes redundant (a token prefix of it whose reusable range it covers).
+
+Restarts: the SSD tier is re-indexed from the file headers at startup, in modification
+time order. The fingerprint is a hash of `config.json` (weights, quantization, spec) plus
+the KV head geometry and the ring sizes; files that do not match (other weights, or a
+`--chunk` that changes the ring size) are deleted. Full-attention slot counts are not part
+of it, so snapshots survive a different `--ctx` as long as they fit. Routing bias is not
+part of it either: as with in-memory prefix reuse, KV computed with cache-aware routing is
+reused as is.
+
+`/v1/stats` reports `kv` (active length and bytes, checkpoint position, store tiers,
+hits, bytes moved, times), and each completion's usage reports `prompt_tokens_cached` and
+`prompt_cache_source` (`live`, `ckpt`, `ram`, `disk`, `none`).
 
 ## Tokenizer and chat formats
 
@@ -160,3 +359,8 @@ counters (hit rates, bytes read, demand wait, router swaps, MLX memory).
 
 Self-speculative decoding and the token-id prior from the study (both measured as net
 losses there), tool-call parsing, batched requests, MLX-community safetensors as input.
+For the KV cache: float16/quantized KV (it would halve memory again but break the float32
+convention, and SDPA needs matching dtypes), offloading the active conversation's KV
+(see [Memory tiers](#memory-tiers)), asynchronous snapshot writes (a save happens
+synchronously before the next prefill), and letting the KV cache grow into the cold expert
+budget instead of being allocated at `--ctx`.
