@@ -5,7 +5,8 @@
             "includePath": [
                 "${workspaceFolder}/**",
                 "/opt/homebrew/opt/mlx/include",
-                "/opt/homebrew/opt/nlohmann-json/include"
+                "/opt/homebrew/opt/nlohmann-json/include",
+                "/opt/homebrew/opt/cpp-httplib/include"
             ],
             "defines": [],
             "compilerPath": "/usr/bin/clang",
