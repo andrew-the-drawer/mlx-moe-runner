@@ -58,6 +58,8 @@ add_library(mmr_core STATIC
   src/engine/router.cpp
   src/engine/lookahead.cpp
   src/engine/sampler.cpp
+  src/engine/kv_buffer.cpp
+  src/engine/kv_store.cpp
   src/engine/engine.cpp
   src/engine/plan.cpp
   src/tokenizer/bpe_tokenizer.cpp
@@ -80,7 +82,7 @@ install(TARGETS mlx-moe-runner RUNTIME DESTINATION bin)
 
 if(MMR_BUILD_TESTS)
   enable_testing()
-  foreach(t test_quants test_tokenizer test_cold_loader test_router test_layout)
+  foreach(t test_quants test_tokenizer test_cold_loader test_router test_layout test_kv_buffer test_kv_store)
     add_executable(${t} tests/${t}.cpp)
     target_link_libraries(${t} PRIVATE mmr_core)
     add_test(NAME ${t} COMMAND ${t})

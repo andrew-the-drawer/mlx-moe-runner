@@ -91,6 +91,21 @@ carries gpt-oss analysis / Qwen `<think>` output), `POST /v1/completions`, `GET 
 `GET /v1/stats`, `GET /health`. Requests are served one at a time; the KV cache is reused
 across requests that share a prompt prefix (multi-turn chats only prefill the new turn).
 
+Prefill is SSD-bound on large models (~230 MB of expert reads per prompt token on the
+120b), so switching between conversations is expensive: each switch prefills the whole
+conversation again. The session store keeps the KV of conversations you switched away
+from and restores it when they come back, at ~72 KB of KV per token on the 120b, about
+3,000x less I/O than prefilling it again:
+
+```sh
+mlx-moe-runner serve ~/models/gptoss120b.mlxmoe --kv-disk-gb 20            # SSD tier only
+mlx-moe-runner serve ~/models/gptoss120b.mlxmoe --kv-disk-gb 20 --kv-ram-mb 2048
+```
+
+The SSD tier persists across restarts (`<model-dir>/kv-cache` by default). The RAM tier
+competes with pinned experts for unified memory, so keep it small unless you alternate
+between a few conversations; usage `prompt_cache_source` says where a prefix came from.
+
 ### 4. Pick a configuration
 
 ```sh
@@ -126,7 +141,10 @@ computed at convert time. A profile built from real traffic gives a better pinne
 | `--extra X` | 0 | extra prefetch candidates per layer (costs bandwidth) |
 | `--io-threads` | 8 | parallel SSD readers |
 | `--io-split` | 1 | sub-reads per expert record (0 = one per matrix; measured neutral on the M5 Max SSD) |
-| `--ctx` | 4096 | KV cache length |
+| `--ctx` | 4096 | KV cache length. gpt-oss sliding-window layers keep only the last 384 positions, which roughly halves its KV cache |
+| `--kv-ram-mb` | 0 | session store: idle conversations kept in RAM (moved to SSD when full) |
+| `--kv-disk-gb` | 0 | session store: idle conversations on SSD (0 = off) |
+| `--kv-dir` | `<model-dir>/kv-cache` | session store directory, one process per directory |
 | `--chunk` | 32 | prefill chunk (tokens per pass) |
 
 Recommendations from the study, confirmed here: on a 36 GB Mac pin 32/layer with

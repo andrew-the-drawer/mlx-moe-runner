@@ -183,7 +183,7 @@ int run_server(Engine& engine, const ServerOptions& opts) {
       if (gr.finish_reason == "abort") gr.finish_reason = "stop";
       json usage = {{"prompt_tokens", gr.n_prompt}, {"completion_tokens", gr.n_generated},
                     {"total_tokens", gr.n_prompt + gr.n_generated},
-                    {"prompt_tokens_cached", gr.n_cached},
+                    {"prompt_tokens_cached", gr.n_cached}, {"prompt_cache_source", gr.cache_source},
                     {"prefill_s", gr.prefill_s}, {"decode_s", gr.decode_s},
                     {"tokens_per_second", gr.decode_s > 0 ? gr.n_generated / gr.decode_s : 0.0}};
       if (r.stream) {
@@ -202,8 +202,8 @@ int run_server(Engine& engine, const ServerOptions& opts) {
                     {"choices", json::array({choice})}, {"usage", usage}};
         emit(out.dump());
       }
-      MMR_INFO("%s: %d prompt (%d cached), %d generated, prefill %.2fs, decode %.2fs (%.1f tok/s), %s",
-               id.c_str(), gr.n_prompt, gr.n_cached, gr.n_generated, gr.prefill_s, gr.decode_s,
+      MMR_INFO("%s: %d prompt (%d cached, %s), %d generated, prefill %.2fs, decode %.2fs (%.1f tok/s), %s",
+               id.c_str(), gr.n_prompt, gr.n_cached, gr.cache_source.c_str(), gr.n_generated, gr.prefill_s, gr.decode_s,
                gr.decode_s > 0 ? gr.n_generated / gr.decode_s : 0.0, gr.finish_reason.c_str());
     };
 
